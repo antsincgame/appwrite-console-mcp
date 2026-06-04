@@ -1,4 +1,5 @@
 import * as Appwrite from "node-appwrite";
+import { readFileSync, writeFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -39,9 +40,38 @@ const ALL_SCOPES = (() => {
 const BASE = ENDPOINT.replace(/\/$/, ""); // напр. https://appwrite.vibecoding.by/v1
 const BASE_HEADERS = { "content-type": "application/json", "x-appwrite-response-format": "1.8.0" };
 
+// Кэш на диске: supergateway в stateless-режиме спавнит новый процесс на каждый запрос,
+// поэтому переменные в памяти не живут между вызовами. Храним сессию и ключи проектов в /tmp,
+// чтобы НЕ логиниться каждый раз (Appwrite лимитирует логины ~10/час) и переиспользовать ключи.
+const CACHE_FILE = process.env.MCP_CACHE_FILE || "/tmp/appwrite-mcp-cache.json";
+
 let sessionSecret = null;
 let allowedScopes = null;
 const keyCache = new Map(); // projectId -> секрет админ-ключа
+
+function loadCache() {
+  try {
+    const c = JSON.parse(readFileSync(CACHE_FILE, "utf8"));
+    if (c && typeof c === "object") {
+      if (c.session) sessionSecret = c.session;
+      if (Array.isArray(c.allowedScopes) && c.allowedScopes.length) allowedScopes = c.allowedScopes;
+      if (c.keys && typeof c.keys === "object") {
+        for (const [k, v] of Object.entries(c.keys)) keyCache.set(k, v);
+      }
+    }
+  } catch {}
+}
+function saveCache() {
+  try {
+    writeFileSync(
+      CACHE_FILE,
+      JSON.stringify({ session: sessionSecret, allowedScopes, keys: Object.fromEntries(keyCache) })
+    );
+  } catch (e) {
+    console.error("CACHE write error:", e && e.message);
+  }
+}
+loadCache();
 
 function cleanPath(p) {
   let s = String(p || "").trim();
@@ -118,14 +148,14 @@ async function login() {
     throw new Error("Логин прошёл (HTTP " + res.status + "), но секрет сессии не найден ни в теле, ни в Set-Cookie");
   }
   sessionSecret = secret;
+  saveCache();
 }
 async function ensureSession() {
   if (!sessionSecret) await login();
 }
 
 // Запрос в контексте console (рут-сессия), с переавторизацией при 401.
-// ВАЖНО: x-appwrite-mode:admin для проекта console запрещён (нужен только при доступе
-// console-сессией к чужим проектам; мы к ним ходим выпущенными ключами).
+// ВАЖНО: x-appwrite-mode:admin для проекта console запрещён.
 async function consoleCall(method, path, query, body) {
   await ensureSession();
   const headers = () => ({
@@ -137,24 +167,33 @@ async function consoleCall(method, path, query, body) {
     return await rawCall(method, path, { query, body, headers: headers() });
   } catch (e) {
     if (e && e.code === 401) {
-      await login();
+      await login(); // сессия протухла — релогин (и пересохранение кэша)
       return await rawCall(method, path, { query, body, headers: headers() });
     }
     throw e;
   }
 }
 
-// Запрос к данным конкретного проекта по его API-ключу.
+// Запрос к данным конкретного проекта по его API-ключу (лимитам логина не подвержен).
 async function projectCall(projectId, method, path, query, body) {
-  const key = await ensureKey(projectId);
-  return await rawCall(method, path, {
-    query,
-    body,
-    headers: { "x-appwrite-project": projectId, "x-appwrite-key": key },
-  });
+  const doCall = (k) =>
+    rawCall(method, path, { query, body, headers: { "x-appwrite-project": projectId, "x-appwrite-key": k } });
+  let key = await ensureKey(projectId);
+  try {
+    return await doCall(key);
+  } catch (e) {
+    if (e && e.code === 401) {
+      // ключ отозван/удалён — выпустить заново и повторить один раз
+      keyCache.delete(projectId);
+      saveCache();
+      key = await ensureKey(projectId);
+      return await doCall(key);
+    }
+    throw e;
+  }
 }
 
-// Гарантирует свежий админ-ключ (все скоупы) для проекта, кэширует секрет.
+// Гарантирует админ-ключ (все скоупы) для проекта, кэширует секрет на диск.
 async function ensureKey(projectId) {
   if (keyCache.has(projectId)) return keyCache.get(projectId);
   // подчистить прежние ключи mcp-admin (секрет старого получить нельзя)
@@ -182,6 +221,7 @@ async function ensureKey(projectId) {
     created = await mint(allowedScopes);
   }
   keyCache.set(projectId, created.secret);
+  saveCache();
   return created.secret;
 }
 
@@ -201,7 +241,7 @@ const tools = [
   {
     name: "appwrite_request",
     description:
-      "Универсальный запрос к Appwrite API с рут-доступом. target='console' — управление инстансом (проекты, организации, ключи, платформы, вебхуки). target=ID проекта — работа с его данными: databases/tablesdb, users, storage, functions, messaging, teams, sites и т.д. Для проектов админ-ключ со всеми скоупами выпускается автоматически. path указывается без префикса /v1, напр. '/databases' или '/databases/{databaseId}/collections'. ВНИМАНИЕ: метод DELETE необратим.",
+      "Универсальный запрос к Appwrite API с рут-доступом. target='console' — управление инстансом (проекты, организации/команды, ключи, платформы, вебхуки). target=ID проекта — работа с его данными: databases/tablesdb, users, storage, functions, messaging, teams, sites и т.д. Для проектов админ-ключ со всеми скоупами выпускается автоматически. path указывается без префикса /v1, напр. '/databases' или '/databases/{databaseId}/collections'. ВНИМАНИЕ: метод DELETE необратим.",
     inputSchema: {
       type: "object",
       properties: {
@@ -225,7 +265,7 @@ const tools = [
   },
   {
     name: "list_organizations",
-    description: "Список организаций. teamId оттуда нужен для create_project.",
+    description: "Список организаций/команд console. teamId оттуда нужен для create_project.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -235,7 +275,7 @@ const tools = [
       type: "object",
       properties: {
         name: { type: "string" },
-        teamId: { type: "string", description: "ID организации (см. list_organizations)" },
+        teamId: { type: "string", description: "ID организации/команды (см. list_organizations)" },
         projectId: { type: "string", description: "Опционально; если пусто — сгенерируется" },
         region: { type: "string", description: "Опционально, для self-hosted обычно 'default'" },
       },
@@ -280,7 +320,7 @@ function fail(e) {
   return { content: [{ type: "text", text: `Ошибка: ${msg}${parts.length ? " (" + parts.join(", ") + ")" : ""}` }], isError: true };
 }
 
-const server = new Server({ name: "appwrite-console-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
+const server = new Server({ name: "appwrite-console-mcp", version: "1.1.0" }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
@@ -297,8 +337,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return ok({ total: r.total, projects: list });
       }
       case "list_organizations": {
-        const r = await consoleCall("GET", "/organizations");
-        const arr = r.teams || r.organizations || [];
+        // self-hosted: организации это команды console -> /teams
+        const r = await consoleCall("GET", "/teams");
+        const arr = r.teams || [];
         return ok({ total: r.total, organizations: arr.map((t) => ({ id: t.$id, name: t.name })) });
       }
       case "create_project": {
@@ -321,9 +362,4 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 await server.connect(new StdioServerTransport());
-console.error("appwrite-console-mcp запущен (stdio). ENDPOINT=" + ENDPOINT);
-
-// Стартовая проверка доступности Appwrite из контейнера (видно в логах Coolify).
-fetch(BASE + "/health/version", { headers: { "x-appwrite-project": "console" } })
-  .then((r) => r.text().then((t) => console.error("STARTUP appwrite:", r.status, t.slice(0, 200))))
-  .catch((e) => console.error("STARTUP appwrite ERR:", e && e.message, e && e.cause ? (e.cause.code || e.cause.message) : ""));
+console.error("appwrite-console-mcp запущен (stdio). ENDPOINT=" + ENDPOINT + " cache=" + CACHE_FILE);
