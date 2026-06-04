@@ -62,16 +62,41 @@ function paramsFor(method, query, body) {
   return m === "GET" || m === "HEAD" ? query || {} : body || {};
 }
 
+// Логин рут-аккаунтом в console. Сессия приходит в Set-Cookie (a_session_console),
+// поэтому делаем сырой fetch и достаём секрет из куки (или из тела, если вернётся).
 async function login() {
-  const c = new Client().setEndpoint(ENDPOINT).setProject("console");
-  const res = await c.call("POST", url("/account/sessions/email"), JSON_HEADERS, {
-    email: EMAIL,
-    password: PASSWORD,
+  const res = await fetch(url("/account/sessions/email"), {
+    method: "POST",
+    headers: { ...JSON_HEADERS, "X-Appwrite-Project": "console", "X-Appwrite-Response-Format": "1.8.0" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
   });
-  sessionSecret = res && res.secret;
-  if (!sessionSecret) {
-    throw new Error("Логин не вернул secret сессии (включён MFA? ограничение платформы на console?)");
+  const text = await res.text();
+  let body = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {}
+  if (!res.ok) {
+    throw new Error("Логин не удался: HTTP " + res.status + " " + String(body.message || text).slice(0, 300));
   }
+
+  let secret = body && body.secret;
+  if (!secret) {
+    const cookies =
+      typeof res.headers.getSetCookie === "function"
+        ? res.headers.getSetCookie()
+        : [res.headers.get("set-cookie")].filter(Boolean);
+    for (const ck of cookies) {
+      const m = /a_session_console=([^;]+)/.exec(ck);
+      if (m) {
+        secret = decodeURIComponent(m[1]);
+        break;
+      }
+    }
+  }
+  if (!secret) {
+    throw new Error("Логин прошёл (HTTP " + res.status + "), но секрет сессии не найден ни в теле, ни в Set-Cookie");
+  }
+  sessionSecret = secret;
   consoleClient.setSession(sessionSecret);
 }
 async function ensureSession() {
