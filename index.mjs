@@ -39,6 +39,7 @@ const ALL_SCOPES = (() => {
 })();
 
 const JSON_HEADERS = { "content-type": "application/json" };
+const BASE = ENDPOINT.replace(/\/$/, ""); // напр. https://appwrite.vibecoding.by/v1
 
 let sessionSecret = null;
 let allowedScopes = null;
@@ -52,6 +53,10 @@ function cleanPath(p) {
   else if (s === "/v1") s = "/";
   return s;
 }
+// node-appwrite 26: Client.call() ждёт АБСОЛЮТНЫЙ url, поэтому склеиваем сами.
+function url(path) {
+  return BASE + cleanPath(path);
+}
 function paramsFor(method, query, body) {
   const m = String(method).toUpperCase();
   return m === "GET" || m === "HEAD" ? query || {} : body || {};
@@ -59,7 +64,7 @@ function paramsFor(method, query, body) {
 
 async function login() {
   const c = new Client().setEndpoint(ENDPOINT).setProject("console");
-  const res = await c.call("POST", "/account/sessions/email", JSON_HEADERS, {
+  const res = await c.call("POST", url("/account/sessions/email"), JSON_HEADERS, {
     email: EMAIL,
     password: PASSWORD,
   });
@@ -82,7 +87,7 @@ async function consoleCall(method, path, query, body) {
     cookie: `a_session_console=${sessionSecret}`,
   });
   const run = () =>
-    consoleClient.call(String(method).toUpperCase(), cleanPath(path), headers(), paramsFor(method, query, body));
+    consoleClient.call(String(method).toUpperCase(), url(path), headers(), paramsFor(method, query, body));
   try {
     return await run();
   } catch (e) {
@@ -132,7 +137,7 @@ async function apiRequest({ target, method, path, query, body }) {
   if (target === "console") return await consoleCall(method, path, query, body);
   const key = await ensureKey(target);
   const c = new Client().setEndpoint(ENDPOINT).setProject(target).setKey(key);
-  return await c.call(String(method).toUpperCase(), cleanPath(path), JSON_HEADERS, paramsFor(method, query, body));
+  return await c.call(String(method).toUpperCase(), url(path), JSON_HEADERS, paramsFor(method, query, body));
 }
 
 function genId() {
@@ -266,6 +271,6 @@ await server.connect(new StdioServerTransport());
 console.error("appwrite-console-mcp запущен (stdio). ENDPOINT=" + ENDPOINT);
 
 // Стартовая проверка доступности Appwrite из контейнера (видно в логах Coolify).
-fetch(ENDPOINT.replace(/\/$/, "") + "/health/version", { headers: { "X-Appwrite-Project": "console" } })
+fetch(BASE + "/health/version", { headers: { "X-Appwrite-Project": "console" } })
   .then((r) => r.text().then((t) => console.error("STARTUP appwrite:", r.status, t.slice(0, 200))))
   .catch((e) => console.error("STARTUP appwrite ERR:", e && e.message, e && e.cause ? (e.cause.code || e.cause.message) : ""));
