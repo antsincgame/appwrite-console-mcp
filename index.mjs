@@ -3,8 +3,6 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-const { Client } = Appwrite;
-
 const ENDPOINT = process.env.APPWRITE_ENDPOINT;
 const EMAIL = process.env.APPWRITE_EMAIL;
 const PASSWORD = process.env.APPWRITE_PASSWORD;
@@ -32,19 +30,18 @@ const FALLBACK_SCOPES = [
   "rules.read", "rules.write", "tokens.read", "tokens.write", "assistant.read"
 ];
 const ALL_SCOPES = (() => {
-  const fromSdk = Appwrite.Scopes
+  const fromSdk = Appwrite && Appwrite.Scopes
     ? [...new Set(Object.values(Appwrite.Scopes).filter((v) => typeof v === "string"))]
     : [];
   return fromSdk.length ? fromSdk : FALLBACK_SCOPES;
 })();
 
-const JSON_HEADERS = { "content-type": "application/json" };
 const BASE = ENDPOINT.replace(/\/$/, ""); // напр. https://appwrite.vibecoding.by/v1
+const BASE_HEADERS = { "content-type": "application/json", "x-appwrite-response-format": "1.8.0" };
 
 let sessionSecret = null;
 let allowedScopes = null;
 const keyCache = new Map(); // projectId -> секрет админ-ключа
-const consoleClient = new Client().setEndpoint(ENDPOINT).setProject("console");
 
 function cleanPath(p) {
   let s = String(p || "").trim();
@@ -53,21 +50,46 @@ function cleanPath(p) {
   else if (s === "/v1") s = "/";
   return s;
 }
-// node-appwrite 26: Client.call() ждёт АБСОЛЮТНЫЙ url, поэтому склеиваем сами.
-function url(path) {
-  return BASE + cleanPath(path);
-}
-function paramsFor(method, query, body) {
+
+// Единый HTTP-слой поверх fetch (без node-appwrite SDK — он нестабилен между версиями).
+async function rawCall(method, path, { query, body, headers } = {}) {
+  const u = new URL(BASE + cleanPath(path));
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (Array.isArray(v)) v.forEach((x) => u.searchParams.append(k + "[]", String(x)));
+      else if (v !== undefined && v !== null) u.searchParams.append(k, String(v));
+    }
+  }
   const m = String(method).toUpperCase();
-  return m === "GET" || m === "HEAD" ? query || {} : body || {};
+  const init = { method: m, headers: { ...BASE_HEADERS, ...(headers || {}) } };
+  if (m !== "GET" && m !== "HEAD" && body !== undefined && body !== null) {
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(u, init);
+  const text = await res.text();
+  let data = text;
+  if ((res.headers.get("content-type") || "").includes("application/json")) {
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = text;
+    }
+  }
+  if (!res.ok) {
+    const err = new Error((data && data.message) || ("HTTP " + res.status + " " + String(text).slice(0, 300)));
+    err.code = res.status;
+    if (data && data.type) err.type = data.type;
+    err.response = data;
+    throw err;
+  }
+  return data;
 }
 
-// Логин рут-аккаунтом в console. Сессия приходит в Set-Cookie (a_session_console),
-// поэтому делаем сырой fetch и достаём секрет из куки (или из тела, если вернётся).
+// Логин рут-аккаунтом в console. Сессия приходит в Set-Cookie (a_session_console).
 async function login() {
-  const res = await fetch(url("/account/sessions/email"), {
+  const res = await fetch(BASE + "/account/sessions/email", {
     method: "POST",
-    headers: { ...JSON_HEADERS, "X-Appwrite-Project": "console", "X-Appwrite-Response-Format": "1.8.0" },
+    headers: { ...BASE_HEADERS, "x-appwrite-project": "console" },
     body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
   });
   const text = await res.text();
@@ -78,7 +100,6 @@ async function login() {
   if (!res.ok) {
     throw new Error("Логин не удался: HTTP " + res.status + " " + String(body.message || text).slice(0, 300));
   }
-
   let secret = body && body.secret;
   if (!secret) {
     const cookies =
@@ -86,9 +107,9 @@ async function login() {
         ? res.headers.getSetCookie()
         : [res.headers.get("set-cookie")].filter(Boolean);
     for (const ck of cookies) {
-      const m = /a_session_console=([^;]+)/.exec(ck);
-      if (m) {
-        secret = decodeURIComponent(m[1]);
+      const mm = /a_session_console=([^;]+)/.exec(ck);
+      if (mm) {
+        secret = decodeURIComponent(mm[1]);
         break;
       }
     }
@@ -97,7 +118,6 @@ async function login() {
     throw new Error("Логин прошёл (HTTP " + res.status + "), но секрет сессии не найден ни в теле, ни в Set-Cookie");
   }
   sessionSecret = secret;
-  consoleClient.setSession(sessionSecret);
 }
 async function ensureSession() {
   if (!sessionSecret) await login();
@@ -107,21 +127,30 @@ async function ensureSession() {
 async function consoleCall(method, path, query, body) {
   await ensureSession();
   const headers = () => ({
-    ...JSON_HEADERS,
+    "x-appwrite-project": "console",
     "x-appwrite-mode": "admin",
+    "x-appwrite-session": sessionSecret,
     cookie: `a_session_console=${sessionSecret}`,
   });
-  const run = () =>
-    consoleClient.call(String(method).toUpperCase(), url(path), headers(), paramsFor(method, query, body));
   try {
-    return await run();
+    return await rawCall(method, path, { query, body, headers: headers() });
   } catch (e) {
     if (e && e.code === 401) {
       await login();
-      return await run();
+      return await rawCall(method, path, { query, body, headers: headers() });
     }
     throw e;
   }
+}
+
+// Запрос к данным конкретного проекта по его API-ключу.
+async function projectCall(projectId, method, path, query, body) {
+  const key = await ensureKey(projectId);
+  return await rawCall(method, path, {
+    query,
+    body,
+    headers: { "x-appwrite-project": projectId, "x-appwrite-key": key },
+  });
 }
 
 // Гарантирует свежий админ-ключ (все скоупы) для проекта, кэширует секрет.
@@ -160,9 +189,7 @@ async function apiRequest({ target, method, path, query, body }) {
   if (!target) throw new Error("target обязателен: 'console' или ID проекта");
   if (!path) throw new Error("path обязателен, напр. '/databases'");
   if (target === "console") return await consoleCall(method, path, query, body);
-  const key = await ensureKey(target);
-  const c = new Client().setEndpoint(ENDPOINT).setProject(target).setKey(key);
-  return await c.call(String(method).toUpperCase(), url(path), JSON_HEADERS, paramsFor(method, query, body));
+  return await projectCall(target, method, path, query, body);
 }
 
 function genId() {
@@ -244,9 +271,9 @@ function fail(e) {
   if (e && e.type) parts.push(`type=${e.type}`);
   if (e && e.cause && (e.cause.code || e.cause.message)) parts.push(`cause=${e.cause.code || e.cause.message}`);
   let msg = (e && e.message) || String(e);
-  if (e && e.response) {
+  if (e && e.response && typeof e.response === "object") {
     try {
-      msg += " | response: " + (typeof e.response === "string" ? e.response : JSON.stringify(e.response));
+      msg += " | response: " + JSON.stringify(e.response).slice(0, 400);
     } catch {}
   }
   return { content: [{ type: "text", text: `Ошибка: ${msg}${parts.length ? " (" + parts.join(", ") + ")" : ""}` }], isError: true };
@@ -296,6 +323,6 @@ await server.connect(new StdioServerTransport());
 console.error("appwrite-console-mcp запущен (stdio). ENDPOINT=" + ENDPOINT);
 
 // Стартовая проверка доступности Appwrite из контейнера (видно в логах Coolify).
-fetch(BASE + "/health/version", { headers: { "X-Appwrite-Project": "console" } })
+fetch(BASE + "/health/version", { headers: { "x-appwrite-project": "console" } })
   .then((r) => r.text().then((t) => console.error("STARTUP appwrite:", r.status, t.slice(0, 200))))
   .catch((e) => console.error("STARTUP appwrite ERR:", e && e.message, e && e.cause ? (e.cause.code || e.cause.message) : ""));
