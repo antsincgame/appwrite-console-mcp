@@ -209,11 +209,17 @@ function ok(data) {
   return { content: [{ type: "text", text }] };
 }
 function fail(e) {
-  const meta = [];
-  if (e && e.code) meta.push(`code=${e.code}`);
-  if (e && e.type) meta.push(`type=${e.type}`);
-  const msg = (e && e.message) || String(e);
-  return { content: [{ type: "text", text: `Ошибка: ${msg}${meta.length ? " (" + meta.join(", ") + ")" : ""}` }], isError: true };
+  const parts = [];
+  if (e && e.code) parts.push(`code=${e.code}`);
+  if (e && e.type) parts.push(`type=${e.type}`);
+  if (e && e.cause && (e.cause.code || e.cause.message)) parts.push(`cause=${e.cause.code || e.cause.message}`);
+  let msg = (e && e.message) || String(e);
+  if (e && e.response) {
+    try {
+      msg += " | response: " + (typeof e.response === "string" ? e.response : JSON.stringify(e.response));
+    } catch {}
+  }
+  return { content: [{ type: "text", text: `Ошибка: ${msg}${parts.length ? " (" + parts.join(", ") + ")" : ""}` }], isError: true };
 }
 
 const server = new Server({ name: "appwrite-console-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
@@ -251,9 +257,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return fail(new Error(`Неизвестный инструмент: ${name}`));
     }
   } catch (e) {
+    console.error("TOOL ERROR:", (e && (e.stack || e.message)) || e, e && e.cause ? "| cause=" + (e.cause.code || e.cause.message || e.cause) : "");
     return fail(e);
   }
 });
 
 await server.connect(new StdioServerTransport());
-console.error("appwrite-console-mcp запущен (stdio)");
+console.error("appwrite-console-mcp запущен (stdio). ENDPOINT=" + ENDPOINT);
+
+// Стартовая проверка доступности Appwrite из контейнера (видно в логах Coolify).
+fetch(ENDPOINT.replace(/\/$/, "") + "/health/version", { headers: { "X-Appwrite-Project": "console" } })
+  .then((r) => r.text().then((t) => console.error("STARTUP appwrite:", r.status, t.slice(0, 200))))
+  .catch((e) => console.error("STARTUP appwrite ERR:", e && e.message, e && e.cause ? (e.cause.code || e.cause.message) : ""));
