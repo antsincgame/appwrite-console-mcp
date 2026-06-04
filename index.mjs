@@ -210,7 +210,7 @@ const tools = [
         path: { type: "string", description: "Путь API без /v1, напр. /users или /databases/{id}/collections/{cid}/documents" },
         query: {
           type: "object",
-          description: "Query-параметры для GET, напр. {\"queries\":[\"limit(25)\"],\"search\":\"foo\"}",
+          description: "Query-параметры для GET. queries — массив строк-фильтров в JSON-формате Appwrite, напр. {\"queries\":[\"{\\\"method\\\":\\\"limit\\\",\\\"values\\\":[25]}\"]}. Простые параметры — как есть, напр. {\"search\":\"foo\"}.",
           additionalProperties: true,
         },
         body: { type: "object", description: "Тело для POST/PUT/PATCH/DELETE", additionalProperties: true },
@@ -292,12 +292,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "appwrite_request":
         return ok(await apiRequest(args));
       case "list_projects": {
-        const r = await consoleCall("GET", "/projects", { queries: ["limit(500)"] });
+        const r = await consoleCall("GET", "/projects");
         const list = (r.projects || []).map((p) => ({ id: p.$id, name: p.name, teamId: p.teamId, region: p.region }));
         return ok({ total: r.total, projects: list });
       }
       case "list_organizations": {
-        const r = await consoleCall("GET", "/organizations", { queries: ["limit(500)"] });
+        const r = await consoleCall("GET", "/organizations");
         const arr = r.teams || r.organizations || [];
         return ok({ total: r.total, organizations: arr.map((t) => ({ id: t.$id, name: t.name })) });
       }
