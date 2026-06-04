@@ -9,10 +9,11 @@ COPY index.mjs ./
 ENV PORT=8000
 EXPOSE 8000
 
-# stdio MCP -> Streamable HTTP. Секрет в пути = авторизация для коннектора Claude.ai.
+# stdio MCP -> Streamable HTTP (stateless: child поднимается на каждый запрос — надёжнее).
+# Секрет в пути = авторизация для коннектора Claude.ai.
 CMD supergateway \
     --stdio "node /app/index.mjs" \
-    --outputTransport streamableHttp --stateful --sessionTimeout 600000 \
+    --outputTransport streamableHttp \
     --port ${PORT} \
     --streamableHttpPath "/${MCP_SECRET}/mcp" \
     --logLevel info
