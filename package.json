@@ -1,0 +1,13 @@
+{
+  "name": "appwrite-console-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP-сервер с рут-доступом ко всем проектам Appwrite через console-сессию",
+  "main": "index.mjs",
+  "scripts": { "start": "node index.mjs" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "node-appwrite": "26.0.0"
+  }
+}
