@@ -123,12 +123,13 @@ async function ensureSession() {
   if (!sessionSecret) await login();
 }
 
-// Запрос в контексте console (рут-сессия + admin mode), с переавторизацией при 401.
+// Запрос в контексте console (рут-сессия), с переавторизацией при 401.
+// ВАЖНО: x-appwrite-mode:admin для проекта console запрещён (нужен только при доступе
+// console-сессией к чужим проектам; мы к ним ходим выпущенными ключами).
 async function consoleCall(method, path, query, body) {
   await ensureSession();
   const headers = () => ({
     "x-appwrite-project": "console",
-    "x-appwrite-mode": "admin",
     "x-appwrite-session": sessionSecret,
     cookie: `a_session_console=${sessionSecret}`,
   });
